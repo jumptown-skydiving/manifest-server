@@ -263,6 +263,12 @@ func (s *manifestServiceServer) constructUpdate(source core.DataSource) *Manifes
 				})
 			}
 			u.Jumprun.Path = p
+			if len(j.Offsets) > 0 {
+				u.Jumprun.Offsets = make([]int32, len(j.Offsets))
+				for x, offset := range j.Offsets {
+					u.Jumprun.Offsets[x] = int32(offset)
+				}
+			}
 		}
 	}
 
