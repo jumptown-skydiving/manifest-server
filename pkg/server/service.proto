@@ -52,6 +52,7 @@ message JumprunPath {
 message Jumprun {
 	JumprunOrigin origin = 1;
 	optional JumprunPath path = 2;
+	repeated int32 offsets = 3;
 }
 
 message WindsAloftSample {

@@ -151,6 +151,36 @@ func (c *Controller) SetFromURLValues(values url.Values) error {
 		newj.HookTurns[i] = turn
 	}
 
+	x := 0
+	for i := 0; i < len(newj.Offsets); i++ {
+		key := fmt.Sprintf("parallel_offset_%d", i)
+		value := values.Get(key)
+		if value == "" {
+			break
+		}
+
+		var v64 int64
+		if v64, err = strconv.ParseInt(value, 10, 32); err != nil {
+			return fmt.Errorf("cannot parse parallel offset %d: %v", i, err)
+		}
+		if v64 == 0 {
+			continue
+		}
+
+		dupe := false
+		for j := 0; j < x; j++ {
+			if newj.Offsets[j] == int(v64) {
+				dupe = true
+				break
+			}
+		}
+		if dupe {
+			continue
+		}
+		newj.Offsets[x] = int(v64)
+		x++
+	}
+
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	c.jumprun = newj
@@ -348,6 +378,17 @@ const jumprunHTML = `<html>
 					<input type="text" name="hook_distance_{{$index}}" value="{{$element.Distance}}">
 					<label>Heading:<label>
 					<input type="text" name="hook_heading_{{$index}}" value="{{$element.Heading}}">
+				</div>
+				{{end}}
+			</div>
+			<div>
+				<h4>Parallel Runs</h4>
+				Leave these blank if there are to be no additional parallel runs.
+				<p>
+				{{range $index, $element := .Offsets}}
+				<div>
+					<label>Distance:<label>
+					<input type="text" name="parallel_offset_{{$index}}" value="{{$element}}">
 				</div>
 				{{end}}
 			</div>

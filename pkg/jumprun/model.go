@@ -25,6 +25,7 @@ type Jumprun struct {
 	MagneticDeclination int     `json:"magnetic_declination"` // magnetic declination at origin
 	CameraHeight        int     `json:"camera_height"`        // camera height to use for view
 	IsSet               bool    `json:"is_set"`               // true if jumprun is set
+	Offsets             [4]int  `json:"offsets"`              // list of parallel runs (offsets are distances)
 }
 
 func (j *Jumprun) getIntValue(values url.Values, key string, defaultValue int) (int, error) {
