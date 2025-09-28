@@ -5,10 +5,9 @@ package metar
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math"
 	"net/http"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,10 +76,9 @@ var conditions = map[string]string{
 	"UP": "unknown precipitation",
 }
 
-func weatherCondition(wx string) string {
+func parseWeatherCondition(parts []string) (int, string) {
 	var results []string
 
-	parts := strings.Fields(wx)
 	i := 0
 	for i < len(parts) {
 		var intensity, suffix string
@@ -89,10 +87,12 @@ func weatherCondition(wx string) string {
 		switch {
 		case strings.HasPrefix(bit, "-"):
 			intensity = "light "
-			bit = bit[1:]
+			i++
+			bit = parts[i]
 		case strings.HasPrefix(bit, "+"):
 			intensity = "heavy "
-			bit = bit[1:]
+			i++
+			bit = parts[i]
 		case bit == "VC":
 			suffix = " in the vicinity"
 			i++
@@ -112,8 +112,7 @@ func weatherCondition(wx string) string {
 
 		condition, ok := conditions[bit]
 		if !ok {
-			i++
-			continue
+			break
 		}
 
 		i++
@@ -121,18 +120,51 @@ func weatherCondition(wx string) string {
 	}
 
 	if len(results) == 0 {
-		return "clear"
+		return i, "clear"
 	}
-	return strings.Join(results, ", ")
+	return i, strings.Join(results, ", ")
+}
+
+type Winds struct {
+	Speed        int
+	Direction    int
+	Gusting      int
+	Variable     bool
+	VariableLow  int
+	VariableHigh int
+}
+
+func (w *Winds) parse(in []string) int {
+	w.Variable = strings.HasPrefix(in[0], "VRB")
+	if !w.Variable {
+		w.Direction, _ = strconv.Atoi(in[0])
+	}
+	if kt := strings.Index(in[0], "KT"); kt >= 0 {
+		in[0] = in[0][:kt]
+	}
+	if g := strings.Index(in[0], "G"); g >= 0 {
+		w.Gusting, _ = strconv.Atoi(in[0][g+1:])
+		in[0] = in[0][:g]
+	}
+	w.Speed, _ = strconv.Atoi(in[0])
+	if len(in) > 1 {
+		if v := strings.Index(in[1], "V"); v > 0 {
+			w.VariableLow, _ = strconv.Atoi(in[1][:v])
+			w.VariableHigh, _ = strconv.Atoi(in[1][v+1:])
+			return 2
+		}
+	}
+	return 1
 }
 
 type Controller struct {
 	settings *settings.Settings
 
-	lock        sync.Mutex
-	fields      map[string]interface{}
-	skyCover    string
-	wxCondition string
+	lock           sync.Mutex
+	windConditions Winds
+	skyCover       string
+	wxCondition    string
+	temperature    float64
 }
 
 func NewController(settings *settings.Settings) *Controller {
@@ -141,102 +173,133 @@ func NewController(settings *settings.Settings) *Controller {
 	}
 }
 
-const metarURL = "https://aviationweather.gov/cgi-bin/data/dataserver.php?datasource=metars&requesttype=retrieve&format=csv&hoursBeforeNow=24&mostRecent=true"
+const metarURL = "https://aviationweather.gov/api/data/metar?format=raw&hours=2"
 
 // Refresh retrieves and parses weather data.
 func (c *Controller) Refresh() (bool, error) {
-	url := fmt.Sprintf("%s&stationString=%s", metarURL, c.settings.METARStation())
+	url := fmt.Sprintf("%s&ids=%s", metarURL, c.settings.METARStation())
 	resp, err := http.Get(url)
 	if err != nil {
 		return false, err
 	}
 	defer resp.Body.Close()
 
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return false, err
 	}
 
-	// There should be at least 5 lines. Any less is invalid data.
-	// Line 0: "No errors"
-	// Line 1: "No warnings"
-	// Line 2: "%d ms"
-	// Line 3: "data source=metars"
-	// Line 4: "%d results"
-	// Line 5: <csv keywords>
-	// Line 6: <csv data>
+	// There should be at least 1 line. Any less is invalid data.
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) < 5 {
-		for i, l := range lines {
-			l = strings.TrimSpace(l)
-			fmt.Printf("Line %d: %s\n", i, l)
+	if len(lines) < 1 {
+		return false, errors.New("No data returned")
+	}
+
+	for _, line := range lines {
+		var ok bool
+		if ok, err = c.parseLine(line); ok {
+			return true, nil
 		}
-		return false, fmt.Errorf("Too few lines (expected >= 5; got %d)",
-			len(lines))
 	}
 
-	nresults, err := strconv.Atoi(strings.Fields(strings.TrimSpace(lines[4]))[0])
-	if err != nil {
-		return false, fmt.Errorf("Error parsing # results: %v", err)
+	return false, errors.New("No usable data returned")
+}
+
+func (c *Controller) parseLine(line string) (bool, error) {
+	fields := strings.Split(strings.TrimSpace(line), " ")
+	if fields[0] != "SPECI" && fields[0] != "METAR" {
+		return false, fmt.Errorf("Unrecognized record type %s", fields[0])
 	}
-	if nresults < 1 {
-		return false, errors.New("No results")
+	if fields[1] != c.settings.METARStation() {
+		return false, fmt.Errorf("Report for incorrect station %s", fields[1])
+	}
+	// fields[2] observation time
+	// fields[3] AUTO or maybe something else if not automatic (COR for corrected)
+	//
+	// Several things can consume multiple fields, so we'll keep an
+	// index to skip over them as needed
+	idx := 4
+	if idx >= len(fields) {
+		return false, fmt.Errorf("unexpected end of input (start)")
 	}
 
-	var (
-		lowClouds, highClouds []string
-		wxCondition           string
-	)
+	var windConditions Winds
+	idx += windConditions.parse(fields[idx:])
+	if idx >= len(fields) {
+		return false, fmt.Errorf("unexpected end of input (winds)")
+	}
 
-	parsedFields := make(map[string]interface{})
-	names := strings.Split(strings.TrimSpace(lines[5]), ",")
-	fields := strings.Split(strings.TrimSpace(lines[len(lines)-1]), ",")
-	for i, name := range names {
-		switch name {
-		case "wx_string":
-			wxCondition = weatherCondition(fields[i])
-		case "sky_cover":
-			if i+1 < len(names) && names[i+1] == "cloud_base_ft_agl" {
-				var base int
-				base, err = strconv.Atoi(fields[i+1])
-				if err != nil {
-					break
-				}
-				switch fields[i] {
-				case "FEW":
-					lowClouds = append(lowClouds, fmt.Sprintf("few at %d", base))
-				case "SCT":
-					lowClouds = append(lowClouds, fmt.Sprintf("scattered at %d", base))
-				case "BKN":
-					highClouds = append(highClouds, fmt.Sprintf("broken at %d", base))
-				case "OVC":
-					highClouds = append(highClouds, fmt.Sprintf("overcast deck at %d", base))
-				case "OVX":
-					highClouds = append(highClouds, "overcast")
-				case "SKC", "CLR":
-					break
-				}
-			}
-		case "cloud_base_ft_agl":
-			// Always skip; used by "sky_cover"
+	// visibility
+	for ; idx < len(fields); idx += 1 {
+		if strings.HasSuffix(fields[idx], "SM") {
+			continue
+		}
+		break
+	}
+	if idx >= len(fields) {
+		return false, fmt.Errorf("unexpected end of input (visibility)")
+	}
+
+	// runway visual range
+	for ; idx < len(fields); idx += 1 {
+		if strings.HasPrefix(fields[idx], "R") {
+			continue
+		}
+		break
+	}
+	if idx >= len(fields) {
+		return false, fmt.Errorf("unexpected end of input (runway visual range)")
+	}
+
+	n, wxCondition := parseWeatherCondition(fields[idx:])
+	idx += n
+	if idx >= len(fields) {
+		return false, fmt.Errorf("unexpected end of input (weather conditions)")
+	}
+
+	n, skyCover := parseSkyCover(fields[idx:])
+	idx += n
+	if idx >= len(fields) {
+		return false, fmt.Errorf("unexpected end of input (sky cover)")
+	}
+
+	var temperatureInt int
+	var temperatureFloat float64
+	if slash := strings.Index(fields[idx], "/"); slash > 0 {
+		fields[idx] = fields[idx][:slash]
+		neg := strings.HasPrefix(fields[idx], "M")
+		if neg {
+			fields[idx] = fields[idx][1:]
+		}
+		temperatureInt, _ = strconv.Atoi(fields[idx])
+		if neg {
+			temperatureInt = -temperatureInt
+		}
+		temperatureFloat = float64(temperatureInt)
+	}
+	idx += 1
+	if idx >= len(fields) {
+		return false, fmt.Errorf("unexpected end of input (temperature)")
+	}
+
+	// altimeter
+	for ; idx < len(fields); idx += 1 {
+		if !strings.HasPrefix(fields[idx], "A") {
 			break
-		default:
-			var intValue int64
-			if intValue, err = strconv.ParseInt(fields[i], 0, 64); err == nil {
-				parsedFields[name] = intValue
-				break
+		}
+	}
+
+	// Parse remarks
+	// All we're interested in is temperature that's better than
+	// fields[8] because it gives 10ths
+	for ; idx < len(fields); idx += 1 {
+		if fields[idx] == "RMK" {
+			for idx += 1; idx < len(fields); idx += 1 {
+				if fields[idx][0] == 'T' {
+					// TODO parse out this temperature
+				}
 			}
-			var floatValue float64
-			if floatValue, err = strconv.ParseFloat(fields[i], 64); err == nil {
-				parsedFields[name] = floatValue
-				break
-			}
-			var boolValue bool
-			if boolValue, err = strconv.ParseBool(fields[i]); err == nil {
-				parsedFields[name] = boolValue
-				break
-			}
-			parsedFields[name] = fields[i]
+			break
 		}
 	}
 
@@ -244,16 +307,6 @@ func (c *Controller) Refresh() (bool, error) {
 	defer c.lock.Unlock()
 
 	changed := false
-	if !reflect.DeepEqual(c.fields, parsedFields) {
-		c.fields = parsedFields
-		changed = true
-	}
-	skyCover := "clear"
-	if len(highClouds) > 0 {
-		skyCover = strings.Join(highClouds, ", ")
-	} else if len(lowClouds) > 0 {
-		skyCover = strings.Join(lowClouds, ", ")
-	}
 	if c.skyCover != skyCover {
 		c.skyCover = skyCover
 		changed = true
@@ -262,55 +315,89 @@ func (c *Controller) Refresh() (bool, error) {
 		c.wxCondition = wxCondition
 		changed = true
 	}
+	if c.windConditions != windConditions {
+		c.windConditions = windConditions
+		changed = true
+	}
+	if c.temperature != temperatureFloat {
+		c.temperature = temperatureFloat
+		changed = true
+	}
 
 	return changed, nil
+}
+
+func parseSkyCover(in []string) (int, string) {
+	var (
+		lowClouds, highClouds []string
+	)
+
+	idx := 0
+loop:
+	for ; idx < len(in); idx += 1 {
+		if strings.HasPrefix(in[idx], "VV") {
+			base, err := strconv.Atoi(in[idx][2:])
+			if err == nil {
+				base *= 100
+				highClouds = append(highClouds, fmt.Sprintf("ceiling at %d", base))
+			} else {
+				highClouds = append(highClouds, "overcast")
+			}
+			break loop
+		}
+		base, err := strconv.Atoi(in[idx][3:])
+		if err == nil {
+			base *= 100
+			switch in[idx][0:2] {
+			case "FEW":
+				lowClouds = append(lowClouds, fmt.Sprintf("few at %d", base))
+			case "SCT":
+				lowClouds = append(lowClouds, fmt.Sprintf("scattered at %d", base))
+			case "BKN":
+				highClouds = append(highClouds, fmt.Sprintf("broken at %d", base))
+			case "OVC":
+				highClouds = append(highClouds, fmt.Sprintf("overcast deck at %d", base))
+				break loop
+			case "OVX":
+				highClouds = append(highClouds, "overcast")
+				break loop
+			case "SKC", "CLR":
+				highClouds = append(highClouds, "clear")
+				break loop
+			default:
+				break loop
+			}
+		}
+	}
+
+	if len(highClouds) > 0 {
+		return idx, strings.Join(highClouds, ", ")
+	}
+	if len(lowClouds) > 0 {
+		return idx, strings.Join(lowClouds, ", ")
+	}
+	return idx, "clear"
 }
 
 // WindSpeedMPH returns the current wind speed in MPH.
 func (c *Controller) WindSpeedMPH() float64 {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	var speed float64
-	switch v := c.fields["wind_speed_kt"].(type) {
-	case float64:
-		speed = v
-	case int64:
-		speed = float64(v)
-	default:
-		return 0.0
-	}
-	return MPHFromKnots(speed)
+	return MPHFromKnots(float64(c.windConditions.Speed))
 }
 
 // WindGustSpeedMPH returns current wind gust speed in MPH.
 func (c *Controller) WindGustSpeedMPH() float64 {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	var gusting float64
-	switch v := c.fields["wind_gust_kt"].(type) {
-	case float64:
-		gusting = v
-	case int64:
-		gusting = float64(v)
-	default:
-		return 0.0
-	}
-	return MPHFromKnots(gusting)
+	return MPHFromKnots(float64(c.windConditions.Gusting))
 }
 
 // WindDirectionDegrees returns the current wind direction in degrees.
 func (c *Controller) WindDirectionDegrees() float64 {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	var windDirectionDegrees float64
-	switch v := c.fields["wind_dir_degrees"].(type) {
-	case float64:
-		windDirectionDegrees = v
-	case int64:
-		windDirectionDegrees = float64(v)
-	default:
-		return 0.0
-	}
+	windDirectionDegrees := c.windConditions.Direction
 	// Adjust true north to magnetic north. Magnetic deviance for Orange, MA is -14.7
 	// This is a little gross, but use jumprun's magnetic declination setting
 	return float64((int(windDirectionDegrees) + c.settings.JumprunMagneticDeclination() + 360) % 360)
@@ -318,22 +405,23 @@ func (c *Controller) WindDirectionDegrees() float64 {
 
 // WindConditions returns the current wind conditions as a human-readable string.
 func (c *Controller) WindConditions() string {
-	speed := c.WindSpeedMPH()
-	if speed <= 0 {
+	c.lock.Lock()
+	w := c.windConditions
+	c.lock.Unlock()
+
+	if w.Variable || w.Speed <= 0 {
 		return "light and variable"
 	}
 
-	windDirectionDegrees := c.WindDirectionDegrees()
-	windDirection := CardinalDirection(windDirectionDegrees)
+	windDirection := CardinalDirection(float64(w.Direction))
 
-	gusting := c.WindGustSpeedMPH()
-	if gusting > 0 {
+	if w.Gusting > 0 {
 		return fmt.Sprintf("%d MPH gusting to %d MPH from %d° (%s)",
-			int64(speed), int64(gusting),
-			int64(windDirectionDegrees), windDirection)
+			int64(w.Speed), int64(w.Gusting),
+			int64(w.Direction), windDirection)
 	}
 	return fmt.Sprintf("%d MPH from %d° (%s)",
-		int64(speed), int64(windDirectionDegrees), windDirection)
+		int64(w.Speed), int64(w.Direction), windDirection)
 }
 
 // WeatherConditions returns a human-readable description of current weather
@@ -361,30 +449,22 @@ func (c *Controller) SkyCover() string {
 func (c *Controller) TemperatureString() string {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	var temp float64
-	switch v := c.fields["temp_c"].(type) {
-	case float64:
-		temp = v
-	case int64:
-		temp = float64(v)
-	default:
-		return "data error"
-	}
 
+	temp := c.temperature
 	return fmt.Sprintf("%d℃ / %d℉",
 		int64(temp), int64(FahrenheitFromCelsius(temp)))
 }
 
 func (c *Controller) Location() (float64, float64, bool) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	latitude, ok := c.fields["latitude"].(float64)
-	if !ok {
-		return 0, 0, false
+	// METAR data API no longer returns latitude/longitude
+	// Use winds data instead
+	var (
+		err                 error
+		latitude, longitude float64
+	)
+	latitude, err = strconv.ParseFloat(c.settings.WindsLatitude(), 64)
+	if err == nil {
+		longitude, err = strconv.ParseFloat(c.settings.WindsLongitude(), 64)
 	}
-	longitude, ok := c.fields["longitude"].(float64)
-	if !ok {
-		return 0, 0, false
-	}
-	return latitude, longitude, true
+	return latitude, longitude, err == nil
 }
